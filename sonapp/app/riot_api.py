@@ -1,7 +1,7 @@
 # app/riot_api.py
 import requests
 
-RIOT_API_KEY = 'YOUR_RIOT_API_KEY'  # Replace with your actual API key
+RIOT_API_KEY = 'RGAPI-a9f0641b-d5ff-4cd1-be8f-b46793263221'  # Replace with your actual API key
 BASE_URL = 'https://na1.api.riotgames.com'
 
 def get_summoner_by_name(summoner_name):
