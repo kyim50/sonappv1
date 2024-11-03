@@ -1,119 +1,142 @@
-# app/gui.py
 import tkinter as tk
-from tkinter import messagebox
-import socket
 import threading
-from game_checker import get_game_state
-import keyboard  # Requires the keyboard library
-import audio_handler  # Assuming your audio handling code is in this module
+import subprocess
+import socket
+import sounddevice as sd
+import numpy as np
 
-class VoiceChatApp:
+# Server configuration
+HOST = '127.0.0.1'
+PORT = 65432
+BUFFER_SIZE = 4096  # Match the buffer size used in server.py
+
+clients = []
+
+def handle_client(conn):
+    """Handles communication with a connected client."""
+    with conn:
+        print(f"Connection from {conn.getpeername()} has been established.")
+        while True:
+            data = conn.recv(BUFFER_SIZE)
+            if not data:
+                print(f"Connection from {conn.getpeername()} has been closed.")
+                break
+            
+            # Broadcast audio data to all clients
+            for client in clients:
+                if client != conn:
+                    try:
+                        client.sendall(data)
+                    except Exception as e:
+                        print(f"Error sending audio to client: {e}")
+
+def start_server():
+    """Starts the audio server and handles incoming clients."""
+    global clients
+    clients = []
+    
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind((HOST, PORT))
+        s.listen()
+        print(f"Server started at {HOST}:{PORT}")
+
+        while True:
+            conn, addr = s.accept()
+            clients.append(conn)
+            threading.Thread(target=handle_client, args=(conn,), daemon=True).start()
+
+def audio_input_stream():
+    """Continuously captures audio input from the microphone and sends to clients."""
+    with sd.InputStream(samplerate=44100, channels=1) as stream:
+        print("Audio input stream started")
+        while True:
+            data = stream.read(BUFFER_SIZE)[0]
+            audio_bytes = data.astype(np.float32).tobytes()
+            for client in clients:
+                try:
+                    client.sendall(audio_bytes)
+                except Exception as e:
+                    print(f"Error sending audio to client: {e}")
+
+def start_audio_communication():
+    """Starts the server and audio input stream in separate threads."""
+    server_thread = threading.Thread(target=start_server, daemon=True)
+    server_thread.start()
+    audio_thread = threading.Thread(target=audio_input_stream, daemon=True)
+    audio_thread.start()
+
+# GUI Setup
+class AudioApp:
     def __init__(self, master):
         self.master = master
-        self.master.title("League of Legends Voice Chat")
-        self.master.geometry("300x400")
+        master.title("Audio Communication App")
 
-        self.server_host = "127.0.0.1"
-        self.server_port = 65432
-        self.client_socket = None
+        self.start_button = tk.Button(master, text="Start Server", command=self.start_server)
+        self.start_button.pack(pady=20)
 
-        # Connection Status
-        self.status_label = tk.Label(master, text="Disconnected", fg="red")
-        self.status_label.pack(pady=10)
+        self.connect_button = tk.Button(master, text="Connect", command=self.connect_to_audio_handler, state=tk.DISABLED)
+        self.connect_button.pack(pady=20)
 
-        # Connect Button
-        self.connect_button = tk.Button(master, text="Connect", command=self.connect_to_server)
-        self.connect_button.pack(pady=10)
+        self.disconnect_button = tk.Button(master, text="Disconnect", command=self.disconnect, state=tk.DISABLED)
+        self.disconnect_button.pack(pady=20)
 
-        # Mute/Unmute Button
-        self.mute_button = tk.Button(master, text="Mute", command=self.toggle_mute)
-        self.mute_button.pack(pady=10)
+        self.mute_button = tk.Button(master, text="Mute", command=self.mute_audio, state=tk.DISABLED)
+        self.mute_button.pack(pady=20)
 
-        # Volume Control
-        self.volume_scale = tk.Scale(master, from_=0, to=100, orient=tk.HORIZONTAL, label="Volume")
-        self.volume_scale.set(50)  # Default volume
-        self.volume_scale.pack(pady=10)
+        self.status_label = tk.Label(master, text="Server not started.")
+        self.status_label.pack(pady=20)
 
-        # Push-to-Talk Button
-        self.ptt_button = tk.Button(master, text="Push to Talk", command=self.start_ptt)
-        self.ptt_button.pack(pady=10)
+        self.muted = False
+        self.audio_handler_process = None
 
-        # Connected Users List
-        self.connected_users_list = tk.Listbox(master)
-        self.connected_users_list.pack(pady=10, fill=tk.BOTH, expand=True)
+    def start_server(self):
+        """Starts the audio server and updates the GUI."""
+        self.start_button.config(state=tk.DISABLED)
+        self.status_label.config(text="Starting server...")
+        threading.Thread(target=self.run_server_thread, daemon=True).start()
 
-        self.is_muted = False
-        self.volume = 50
+    def run_server_thread(self):
+        """Runs the server in a separate thread and updates the status."""
+        start_audio_communication()  # Start the server and audio input stream
+        self.update_status()  # Update status once the server starts
 
-        # Game State Label
-        self.game_state_label = tk.Label(master, text="Game State: Unknown", fg="orange")
-        self.game_state_label.pack(pady=10)
+    def update_status(self):
+        """Updates the GUI status."""
+        self.status_label.config(text="Server started, ready for connections.")
+        self.connect_button.config(state=tk.NORMAL)
 
-        # Check game state every second
-        self.check_game_state()
+    def connect_to_audio_handler(self):
+        """Runs audio_handler.py in a separate process."""
+        self.connect_button.config(state=tk.DISABLED)
+        self.disconnect_button.config(state=tk.NORMAL)
+        self.mute_button.config(state=tk.NORMAL)
 
-        # PTT key
-        self.ptt_key = 'space'  # Default key for PTT
+        # Start audio_handler.py
+        self.audio_handler_process = subprocess.Popen(['python', 'audio_handler.py'], cwd='c:/Users/kiman/Desktop/sonapp/sonappv1/sonapp/app/')
 
-    def connect_to_server(self):
-        """Connects to the audio server."""
-        try:
-            self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.client_socket.connect((self.server_host, self.server_port))
-            self.status_label.config(text="Connected", fg="green")
-            threading.Thread(target=audio_handler.start_audio_communication, daemon=True).start()
-            self.update_connected_users()
-        except Exception as e:
-            messagebox.showerror("Connection Error", f"Could not connect to server: {e}")
+    def disconnect(self):
+        """Disconnects from the audio handler and cleans up."""
+        if self.audio_handler_process:
+            self.audio_handler_process.terminate()  # Stop the audio handler
+            self.audio_handler_process = None
+            self.status_label.config(text="Disconnected from audio handler.")
+            self.connect_button.config(state=tk.NORMAL)
+            self.disconnect_button.config(state=tk.DISABLED)
+            self.mute_button.config(state=tk.DISABLED)
 
-    def toggle_mute(self):
-        """Toggles the mute state."""
-        self.is_muted = not self.is_muted
-        self.mute_button.config(text="Unmute" if self.is_muted else "Mute")
-
-    def start_ptt(self):
-        """Start push-to-talk functionality."""
-        def ptt():
-            if not self.is_muted:
-                audio_handler.send_audio_with_ptt(self.ptt_key)  # Assuming this function captures audio only when PTT is active
-
-        # Register the PTT key event
-        keyboard.on_press_key(self.ptt_key, lambda _: ptt())
-        keyboard.on_release_key(self.ptt_key, lambda _: audio_handler.stop_sending_audio())
-
-    def update_connected_users(self):
-        """Updates the list of connected users."""
-        self.connected_users_list.delete(0, tk.END)
-        # For simplicity, this example uses dummy data; replace this with actual logic to fetch connected users
-        self.connected_users_list.insert(tk.END, "User1")
-        self.connected_users_list.insert(tk.END, "User2")
-
-    def check_game_state(self):
-        """Check and update the game state."""
-        state = get_game_state()
-        self.game_state_label.config(text=f"Game State: {state}")
-        if state == "In Game":
-            self.create_voice_channel()
-            # Automatically join the voice channel here
-            # join_voice_channel()  # Replace with your logic to join the channel
-        self.master.after(1000, self.check_game_state)  # Check every second
-
-    def create_voice_channel(self):
-        """Create a voice channel for the user."""
-        # Implement logic to create a voice channel here
-        print("Voice channel created.")
-
-    def receive_audio(self):
-        """Placeholder for audio receiving logic. Replace with actual implementation."""
-        while self.client_socket:
-            try:
-                # Here you would receive audio data and process it
-                pass
-            except Exception as e:
-                print(f"Error receiving audio: {e}")
-                break
+    def mute_audio(self):
+        """Mutes/unmutes the audio input."""
+        self.muted = not self.muted
+        if self.muted:
+            sd.default.device = (1, None)  # Mute the input
+            self.mute_button.config(text="Unmute")
+            self.status_label.config(text="Microphone is muted.")
+        else:
+            sd.default.device = (0, None)  # Reset to default input device
+            self.mute_button.config(text="Mute")
+            self.status_label.config(text="Microphone is unmuted.")
 
 if __name__ == "__main__":
     root = tk.Tk()
-    app = VoiceChatApp(root)
+    app = AudioApp(root)
     root.mainloop()

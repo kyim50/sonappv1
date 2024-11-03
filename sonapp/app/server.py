@@ -60,3 +60,4 @@ def audio_input_stream():
 if __name__ == "__main__":
     threading.Thread(target=start_server, daemon=True).start()
     audio_input_stream()  # Start capturing and sending audio
+
