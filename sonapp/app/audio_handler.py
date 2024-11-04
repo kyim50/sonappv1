@@ -2,16 +2,37 @@ import sounddevice as sd
 import socket
 import threading
 import numpy as np
+import time
 
 # Set constants
 CHANNELS = 1
 HOST = '127.0.0.1'  # Replace with your server's IP
 PORT = 65432        # Replace with your server's port
-BUFFER_SIZE = 32     # Further reduced buffer size for even lower latency
+BUFFER_SIZE = 32    # Further reduced buffer size for even lower latency
 
-# Select input/output devices
-INPUT_DEVICE_ID = 1  # Replace with your input device ID
-OUTPUT_DEVICE_ID = 12  # Replace with your output device ID
+# Automatically find input and output devices
+devices = sd.query_devices()
+INPUT_DEVICE_ID = None
+OUTPUT_DEVICE_ID = None
+
+# Find the first input and output device
+for idx, device in enumerate(devices):
+    max_input_channels = device.get('maxInputChannels', 0)  # Use get to avoid KeyError
+    max_output_channels = device.get('maxOutputChannels', 0)  # Use get to avoid KeyError
+    
+    if max_input_channels > 0 and INPUT_DEVICE_ID is None:
+        INPUT_DEVICE_ID = idx
+    if max_output_channels > 0 and OUTPUT_DEVICE_ID is None:
+        OUTPUT_DEVICE_ID = idx
+    
+    if INPUT_DEVICE_ID is not None and OUTPUT_DEVICE_ID is not None:
+        break  # Exit the loop if both devices are found
+
+if INPUT_DEVICE_ID is None or OUTPUT_DEVICE_ID is None:
+    print("Input Device ID:", INPUT_DEVICE_ID)
+    print("Output Device ID:", OUTPUT_DEVICE_ID)
+    raise RuntimeError("No input or output device found.")
+
 
 # Get the maximum sample rate of the output device
 output_device_info = sd.query_devices(OUTPUT_DEVICE_ID, 'output')
@@ -20,8 +41,17 @@ SAMPLE_RATE = min(int(output_device_info['default_samplerate']), 48000)  # Use a
 # Create socket connection
 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)  # Disable Nagle's algorithm
-sock.connect((HOST, PORT))
-print("Connected to server for sending audio")
+
+def connect_to_server():
+    global sock
+    while True:
+        try:
+            sock.connect((HOST, PORT))
+            print("Connected to server for sending audio")
+            break  # Exit the loop on successful connection
+        except ConnectionRefusedError:
+            print("Connection refused, retrying in 1 second...")
+            time.sleep(1)  # Wait for a second before retrying
 
 def audio_callback(outdata, frames, time, status):
     if status:
@@ -38,24 +68,6 @@ def audio_callback(outdata, frames, time, status):
             outdata[audio_array.size:] = 0  # Fill the rest with zeros if there's less data
     except Exception as e:
         print(f"Error in audio callback: {e}")
-
-import time  # Import time module at the top
-
-# Existing code...
-
-# Create socket connection in a function instead of immediately
-def connect_to_server():
-    global sock
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    while True:
-        try:
-            sock.connect((HOST, PORT))
-            print("Connected to server for sending audio")
-            break  # Exit the loop on successful connection
-        except ConnectionRefusedError:
-            print("Connection refused, retrying in 1 second...")
-            time.sleep(1)  # Wait for a second before retrying
-
 
 def start_audio_communication():
     """Starts the audio communication."""
@@ -75,4 +87,5 @@ def send_audio():
 
 # Start threads for audio communication
 threading.Thread(target=start_audio_communication, daemon=True).start()
+connect_to_server()  # Ensure the connection to the server is established
 send_audio()
