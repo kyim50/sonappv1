@@ -5,70 +5,101 @@ from collections import deque
 import time
 import json
 import netifaces
+import wave
+import os
 
 class AudioServer:
     def __init__(self, channels=1, buffer_size=1024, discovery_port=65431):
         self.channels = channels
         self.buffer_size = buffer_size
-        self.discovery_port = discovery_port  # Port for server discovery
-        self.stream_port = 65432  # Port for audio streaming
-        self.clients = {}  # Dictionary to store client connections and their buffers
+        self.discovery_port = discovery_port
+        self.stream_port = 65432
+        self.clients = {}
         self.running = True
         
-        # Get server IP address
+        # Add audio level monitoring
+        self.audio_levels = {}
+        
         self.host = self.get_local_ip()
+        print(f"\n=== Audio Server ===")
         print(f"Server IP address: {self.host}")
         
-        # Create server socket
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         
-        # Create discovery socket
         self.discovery_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.discovery_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.discovery_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        
+        # Start status display thread
+        self.status_thread = threading.Thread(target=self.display_status, daemon=True)
+        self.status_thread.start()
 
     def get_local_ip(self):
-        """Get the local IP address of the machine"""
         try:
-            # Try to get IP address from common interfaces
             for interface in netifaces.interfaces():
                 addrs = netifaces.ifaddresses(interface)
                 if netifaces.AF_INET in addrs:
                     for addr in addrs[netifaces.AF_INET]:
                         ip = addr['addr']
-                        # Ignore localhost
                         if not ip.startswith('127.'):
                             return ip
             
-            # Fallback to socket method if no suitable interface found
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
                 s.connect(('8.8.8.8', 80))
                 return s.getsockname()[0]
         except Exception as e:
             print(f"Error getting IP address: {e}")
-            return '127.0.0.1'  # Fallback to localhost if all methods fail
+            return '127.0.0.1'
+
+    def calculate_audio_level(self, audio_data):
+        """Calculate RMS audio level in dB"""
+        try:
+            audio_array = np.frombuffer(audio_data, dtype=np.float32)
+            rms = np.sqrt(np.mean(np.square(audio_array)))
+            db = 20 * np.log10(rms) if rms > 0 else -100
+            return max(-100, db)  # Limit minimum to -100 dB
+        except:
+            return -100
+
+    def display_status(self):
+        """Display server status and audio levels"""
+        while self.running:
+            os.system('cls' if os.name == 'nt' else 'clear')
+            print("\n=== Audio Server Status ===")
+            print(f"Server IP: {self.host}:{self.stream_port}")
+            print(f"Connected clients: {len(self.clients)}")
+            print("\nAudio Levels:")
+            print("-" * 50)
+            
+            for client_id, client_data in self.clients.items():
+                address = client_data['address']
+                level = self.audio_levels.get(client_id, -100)
+                bars = '█' * int((level + 100) // 5)  # Convert dB to visual bars
+                print(f"{address[0]}:{address[1]}")
+                print(f"Level: {bars} {level:.1f} dB")
+                print("-" * 50)
+            
+            time.sleep(0.1)
 
     def handle_discovery(self):
-        """Handle server discovery requests"""
         self.discovery_socket.bind(('', self.discovery_port))
         print(f"Discovery service running on port {self.discovery_port}")
         
         while self.running:
             try:
                 _, client_address = self.discovery_socket.recvfrom(1024)
-                # Send server information to client
                 server_info = {
                     'host': self.host,
                     'port': self.stream_port
                 }
+                print(f"\nDiscovery request from {client_address[0]}")
                 self.discovery_socket.sendto(json.dumps(server_info).encode(), client_address)
             except Exception as e:
-                if self.running:  # Only print error if we're still meant to be running
+                if self.running:
                     print(f"Discovery error: {e}")
 
     def mix_audio(self, current_client_id):
-        """Mix audio from all clients except the current one"""
         mixed = np.zeros(self.buffer_size, dtype=np.float32)
         active_clients = 0
         
@@ -90,7 +121,6 @@ class AudioServer:
         return mixed.tobytes()
 
     def handle_client(self, client_socket, client_address):
-        """Handle individual client connections"""
         client_id = id(client_socket)
         self.clients[client_id] = {
             'socket': client_socket,
@@ -98,13 +128,16 @@ class AudioServer:
             'buffer': deque(maxlen=5)
         }
         
-        print(f"New client connected: {client_address}")
+        print(f"\nNew client connected: {client_address}")
         
         try:
             while self.running:
                 data = client_socket.recv(self.buffer_size * 4)
                 if not data:
                     break
+                
+                # Update audio level for this client
+                self.audio_levels[client_id] = self.calculate_audio_level(data)
                 
                 self.clients[client_id]['buffer'].append(data)
                 mixed_audio = self.mix_audio(client_id)
@@ -113,18 +146,17 @@ class AudioServer:
         except Exception as e:
             print(f"Error handling client {client_address}: {e}")
         finally:
-            print(f"Client disconnected: {client_address}")
+            print(f"\nClient disconnected: {client_address}")
+            if client_id in self.audio_levels:
+                del self.audio_levels[client_id]
             del self.clients[client_id]
             client_socket.close()
 
     def start(self):
-        """Start the audio server"""
         try:
-            # Start discovery service
             discovery_thread = threading.Thread(target=self.handle_discovery, daemon=True)
             discovery_thread.start()
             
-            # Start audio streaming service
             self.server_socket.bind((self.host, self.stream_port))
             self.server_socket.listen(5)
             print(f"Server started on {self.host}:{self.stream_port}")
@@ -144,13 +176,12 @@ class AudioServer:
             self.stop()
 
     def stop(self):
-        """Stop the server and clean up"""
         self.running = False
         self.discovery_socket.close()
         for client_id, client_data in list(self.clients.items()):
             client_data['socket'].close()
         self.server_socket.close()
-        print("Server stopped")
+        print("\nServer stopped")
 
 if __name__ == "__main__":
     server = AudioServer()
