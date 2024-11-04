@@ -112,7 +112,7 @@ class AudioApp:
         self.mute_button.config(state=tk.NORMAL)
 
         # Start audio_handler.py
-        self.audio_handler_process = subprocess.Popen(['python', 'audio_handler.py'], cwd='c:/Users/kiman/Desktop/sonapp/sonappv1/sonapp/app/')
+        self.audio_handler_process = subprocess.Popen(['python', 'audio_handler.py'])
 
     def disconnect(self):
         """Disconnects from the audio handler and cleans up."""
