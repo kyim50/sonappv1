@@ -5,6 +5,8 @@ import base64
 import psutil
 import re
 import os
+import socket
+import threading
 from urllib3.exceptions import InsecureRequestWarning
 from dotenv import load_dotenv
 load_dotenv()
@@ -14,7 +16,7 @@ requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
 # Your Riot API key
 RIOT_API_KEY = os.getenv('RIOT_API_KEY')
 
-class LoLClientMonitor:
+class LoLMatchDiscovery:
     def __init__(self):
         self.lcu_port = None
         self.lcu_token = None
@@ -23,7 +25,185 @@ class LoLClientMonitor:
         self.last_game_state = None
         self.in_champ_select = False
         self.in_game = False
+        self.current_match_id = None
+        self.match_participants = []
         
+        # Network discovery settings
+        self.discovery_port = 65433
+        self.peer_port = 65434
+        self.peers_in_match = {}
+        self.running = True
+        
+        # Start network discovery
+        self.start_network_discovery()
+        
+    def start_network_discovery(self):
+        """Start UDP discovery and TCP peer communication"""
+        # UDP Discovery thread
+        discovery_thread = threading.Thread(target=self.handle_discovery, daemon=True)
+        discovery_thread.start()
+        
+        # TCP Peer server thread
+        peer_server_thread = threading.Thread(target=self.start_peer_server, daemon=True)
+        peer_server_thread.start()
+        
+    def handle_discovery(self):
+        """Handle UDP broadcast discovery"""
+        discovery_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        discovery_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        discovery_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        discovery_socket.bind(('', self.discovery_port))
+        
+        print(f"🌐 Discovery service started on port {self.discovery_port}")
+        
+        while self.running:
+            try:
+                data, addr = discovery_socket.recvfrom(1024)
+                message = json.loads(data.decode())
+                
+                if message.get('type') == 'match_discovery':
+                    # Someone is looking for peers in their match
+                    if (self.current_match_id and 
+                        message.get('match_id') == self.current_match_id and
+                        message.get('summoner_name') != self.current_summoner.get('displayName')):
+                        
+                        # We're in the same match! Respond
+                        response = {
+                            'type': 'match_response',
+                            'summoner_name': self.current_summoner.get('displayName'),
+                            'match_id': self.current_match_id,
+                            'peer_port': self.peer_port
+                        }
+                        
+                        discovery_socket.sendto(json.dumps(response).encode(), addr)
+                        print(f"🎯 MATCH PEER FOUND: {message.get('summoner_name')} at {addr[0]}")
+                        
+                        # Add to peers list
+                        self.peers_in_match[addr[0]] = {
+                            'summoner_name': message.get('summoner_name'),
+                            'address': addr[0],
+                            'connected': False
+                        }
+                        
+                        # Try to connect to them
+                        threading.Thread(target=self.connect_to_peer, args=(addr[0],), daemon=True).start()
+                        
+                elif message.get('type') == 'match_response':
+                    # Someone responded to our discovery
+                    if message.get('match_id') == self.current_match_id:
+                        print(f"🎯 PEER RESPONDED: {message.get('summoner_name')} at {addr[0]}")
+                        
+                        self.peers_in_match[addr[0]] = {
+                            'summoner_name': message.get('summoner_name'),
+                            'address': addr[0],
+                            'connected': False
+                        }
+                        
+                        # Try to connect to them
+                        threading.Thread(target=self.connect_to_peer, args=(addr[0],), daemon=True).start()
+                        
+            except Exception as e:
+                if self.running:
+                    print(f"Discovery error: {e}")
+                    
+    def broadcast_match_discovery(self):
+        """Broadcast that we're looking for peers in our current match"""
+        if not self.current_match_id or not self.current_summoner:
+            return
+            
+        discovery_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        discovery_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        
+        message = {
+            'type': 'match_discovery',
+            'summoner_name': self.current_summoner.get('displayName'),
+            'match_id': self.current_match_id
+        }
+        
+        try:
+            discovery_socket.sendto(json.dumps(message).encode(), ('<broadcast>', self.discovery_port))
+            print(f"📡 Broadcasting match discovery for: {self.current_match_id}")
+        except Exception as e:
+            print(f"Broadcast error: {e}")
+        finally:
+            discovery_socket.close()
+            
+    def start_peer_server(self):
+        """Start TCP server for peer communication"""
+        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server_socket.bind(('', self.peer_port))
+        server_socket.listen(5)
+        
+        print(f"💬 Peer chat server started on port {self.peer_port}")
+        
+        while self.running:
+            try:
+                client_socket, addr = server_socket.accept()
+                threading.Thread(target=self.handle_peer_connection, args=(client_socket, addr), daemon=True).start()
+            except Exception as e:
+                if self.running:
+                    print(f"Peer server error: {e}")
+                    
+    def handle_peer_connection(self, client_socket, addr):
+        """Handle incoming peer connection"""
+        try:
+            while self.running:
+                data = client_socket.recv(1024)
+                if not data:
+                    break
+                    
+                message = json.loads(data.decode())
+                if message.get('type') == 'chat':
+                    print(f"💬 [{message.get('summoner_name')}]: {message.get('text')}")
+                    
+        except Exception as e:
+            print(f"Peer connection error: {e}")
+        finally:
+            client_socket.close()
+            
+    def connect_to_peer(self, peer_ip):
+        """Connect to a discovered peer"""
+        try:
+            time.sleep(1)  # Small delay to avoid connection conflicts
+            peer_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            peer_socket.connect((peer_ip, self.peer_port))
+            
+            if peer_ip in self.peers_in_match:
+                self.peers_in_match[peer_ip]['connected'] = True
+                self.peers_in_match[peer_ip]['socket'] = peer_socket
+                
+                # Send a greeting message
+                greeting = {
+                    'type': 'chat',
+                    'summoner_name': self.current_summoner.get('displayName'),
+                    'text': f"🎮 Connected! We're in the same League match!"
+                }
+                peer_socket.send(json.dumps(greeting).encode())
+                print(f"✅ Connected to peer: {self.peers_in_match[peer_ip]['summoner_name']}")
+                
+                # Keep connection alive and handle messages
+                self.handle_peer_connection(peer_socket, (peer_ip, self.peer_port))
+                
+        except Exception as e:
+            print(f"Failed to connect to peer {peer_ip}: {e}")
+            
+    def send_message_to_peers(self, text):
+        """Send a message to all connected peers"""
+        message = {
+            'type': 'chat',
+            'summoner_name': self.current_summoner.get('displayName'),
+            'text': text
+        }
+        
+        for peer_ip, peer_data in self.peers_in_match.items():
+            if peer_data.get('connected') and 'socket' in peer_data:
+                try:
+                    peer_data['socket'].send(json.dumps(message).encode())
+                except Exception as e:
+                    print(f"Failed to send message to {peer_data['summoner_name']}: {e}")
+                    peer_data['connected'] = False
+
     def find_lcu_credentials(self):
         """Find League Client process and extract API credentials"""
         # Debug: Print all League-related processes (only once)
@@ -125,6 +305,20 @@ class LoLClientMonitor:
             my_team = champ_select.get('myTeam', [])
             their_team = champ_select.get('theirTeam', [])
             
+            # Create a match ID based on all participant IDs
+            all_participants = []
+            for player in my_team + their_team:
+                if player.get('summonerId'):
+                    all_participants.append(str(player['summonerId']))
+            
+            if all_participants:
+                # Create unique match ID from sorted participant list
+                self.current_match_id = hash(tuple(sorted(all_participants)))
+                print(f"🆔 Match ID: {self.current_match_id}")
+                
+                # Start looking for peers
+                threading.Thread(target=self.broadcast_match_discovery, daemon=True).start()
+            
             print("YOUR TEAM:")
             for player in my_team:
                 summoner_id = player.get('summonerId')
@@ -147,6 +341,8 @@ class LoLClientMonitor:
                         
         elif not champ_select and self.in_champ_select:
             self.in_champ_select = False
+            self.current_match_id = None
+            self.peers_in_match.clear()
             print("❌ Champion select ended")
     
     def check_in_game(self):
@@ -164,6 +360,12 @@ class LoLClientMonitor:
                 if active_game:
                     participants = active_game.get('participants', [])
                     
+                    # Update match ID with actual game data if available
+                    if participants and not self.current_match_id:
+                        participant_names = [p.get('summonerName', '') for p in participants]
+                        self.current_match_id = hash(tuple(sorted(participant_names)))
+                        threading.Thread(target=self.broadcast_match_discovery, daemon=True).start()
+                    
                     # Separate teams
                     team1 = [p for p in participants if p.get('teamId') == 100]
                     team2 = [p for p in participants if p.get('teamId') == 200]
@@ -180,13 +382,28 @@ class LoLClientMonitor:
                         champion = player.get('championId', '?')
                         print(f"  • {name} (Champion ID: {champion})")
                         
+                    if self.peers_in_match:
+                        print(f"\n🌐 CONNECTED PEERS IN THIS MATCH: {len(self.peers_in_match)}")
+                        for peer_ip, peer_data in self.peers_in_match.items():
+                            status = "✅ Connected" if peer_data['connected'] else "⏳ Connecting..."
+                            print(f"  • {peer_data['summoner_name']} ({peer_ip}) - {status}")
+                        
+                        print("\n💬 Type messages to send to connected peers:")
+                        
         elif not (game_session and game_session.get('phase') == 'InProgress') and self.in_game:
             self.in_game = False
+            self.current_match_id = None
+            self.peers_in_match.clear()
             print("❌ Game ended")
     
     def monitor(self):
         """Main monitoring loop"""
         print("🔍 Looking for League of Legends client...")
+        print("💡 This script will find other players running the same script in your match!")
+        
+        # Start input thread for chat
+        input_thread = threading.Thread(target=self.handle_chat_input, daemon=True)
+        input_thread.start()
         
         while True:
             # Check if client is running
@@ -196,6 +413,8 @@ class LoLClientMonitor:
                     self.current_summoner = None
                     self.in_champ_select = False
                     self.in_game = False
+                    self.current_match_id = None
+                    self.peers_in_match.clear()
                 time.sleep(3)
                 continue
             
@@ -215,14 +434,25 @@ class LoLClientMonitor:
                 print(f"Error checking game state: {e}")
             
             time.sleep(1)
+    
+    def handle_chat_input(self):
+        """Handle chat input in a separate thread"""
+        while self.running:
+            try:
+                message = input()
+                if message.strip() and self.peers_in_match:
+                    self.send_message_to_peers(message)
+            except:
+                pass
 
 if __name__ == "__main__":
     if not RIOT_API_KEY:
         print("⚠️  Warning: RIOT_API_KEY environment variable not set")
         print("   (The script will still work for basic client detection)")
     
-    monitor = LoLClientMonitor()
+    monitor = LoLMatchDiscovery()
     try:
         monitor.monitor()
     except KeyboardInterrupt:
         print("\n👋 Monitoring stopped")
+        monitor.running = False
